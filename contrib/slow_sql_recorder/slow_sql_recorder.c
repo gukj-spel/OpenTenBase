@@ -142,6 +142,8 @@ _PG_init(void)
 
     // prev_ExecutorEnd = ExecutorEnd_hook;
     // ExecutorEnd_hook = explain_ExecutorEnd;
+    RequestAddinShmemSpace(MAXALIGN(sizeof(sslSharedState)));
+    RequestNamedLWLockTranche("slow_sql_recorder", 1);
 }
 
 /*
@@ -207,6 +209,8 @@ static bool ssl_close_spi(void){
 static bool 
 ssl_store(const char* query, double total_time){
     FILE* file;
+    LWLockAcquire(ssl_shared_state->lock, LW_EXCLUSIVE);
+    elog(LOG, "[ssl store], log_file:%s\n", SSL_LOG_FILE);
     file = AllocateFile(SSL_LOG_FILE, "a");
 
     if(file == NULL){
@@ -216,12 +220,11 @@ ssl_store(const char* query, double total_time){
     if(fprintf(file, "%s,%.2f\n", query, total_time) <= 0 ||fflush(file) != 0){
         goto error;
     }
-    if(file != NULL){
-        FreeFile(file);
-    }
     if(!ssl_store_log_to_table(query, total_time)){
         goto error;
     }
+    FreeFile(file);
+    LWLockRelease(ssl_shared_state->lock);
     return true;
 
 error:
@@ -232,6 +235,7 @@ error:
     if(file != NULL){
         FreeFile(file);
     }
+    LWLockRelease(ssl_shared_state->lock);
 	/* Mark our write complete */
 	return false;
 }
@@ -378,6 +382,44 @@ ssl_ExecutorEnd(QueryDesc *queryDesc){
         prev_ExecutorEnd_hook(queryDesc);
     else
         standard_ExecutorEnd(queryDesc);
+
+}
+
+static void 
+ssl_shmem_startup(void){
+    /*
+     * Create or attach to the shared memory state, including hash table
+     */
+    bool        found;
+    elog(LOG, "ssl shmem startup\n");
+
+    if (prev_shmem_startup_hook)
+        prev_shmem_startup_hook();
+
+    LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+    ssl_shared_state = (sslSharedState*)ShmemInitStruct("slow_sql_recorder", sizeof(sslSharedState), &found);
+    if (!ssl_shared_state)
+        elog(ERROR, "out of shared memory");
+    elog(LOG, "get_ssl_shared_state");
+
+    if (!found){
+        ssl_shared_state->lock = &(GetNamedLWLockTranche("slow_sql_recorder"))->lock;
+        SpinLockInit(&ssl_shared_state->mutex);
+    }
+    LWLockRelease(AddinShmemInitLock);
+
+    /*
+     * If we're in the postmaster (or a standalone backend...), set up a shmem
+     * exit hook to dump the statistics to disk.
+     */
+    if (!IsUnderPostmaster)
+        on_shmem_exit(ssl_shmem_shutdown, (Datum) 0);
+
+}
+
+static void 
+ssl_shmem_shutdown(int code, Datum arg){
 
 }
 
