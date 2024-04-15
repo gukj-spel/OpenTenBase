@@ -1,6 +1,10 @@
 CREATE EXTENSION slow_sql_recorder;
 SET slow_sql_recorder.ssl_switch = TRUE;
 SET slow_sql_recorder.min_query_duration = 0;
+CREATE TABLE ssl_recoder(
+    sql text,
+    total_time double precision 
+);
 
 --
 -- Setup
@@ -90,6 +94,8 @@ SELECT * FROM t2;			-- ok
 SELECT * FROM t3;			-- ok
 SELECT * FROM t4;			-- failed
 SELECT * FROM t5;			-- failed
+
+SELECT * FROM ssl_recoder;
 
 ---
 -- partitioned table parent

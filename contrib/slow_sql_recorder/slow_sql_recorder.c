@@ -6,9 +6,12 @@
 #include "miscadmin.h"
 #include "port.h"
 #include "pgstat.h"
+#include "executor/spi.h"
 
 PG_MODULE_MAGIC;
 #define SSL_LOG_FILE	"pg_log/slow_sql_log.csv"
+#define SSL_MAX_LOG_SQL 2048
+#define SSL_LOG_TABLE_NAME "ssl_recoder"
 
 // static bool current_query_sampled = true;
 
@@ -50,6 +53,9 @@ static void ssl_ExecutorStart(QueryDesc *queryDesc, int eflags);
 // static void ssl_shmem_startup(void);
 // static void ssl_shmem_shutdown(int code, Datum arg);
 static bool ssl_store(const char* query, double total_time); //write the slow sql to the log file
+static bool ssl_store_log_to_table(const char* query, double total_time);
+static bool ssl_connect_spi(void);
+static bool ssl_close_spi(void);
 
 
 PG_FUNCTION_INFO_V1(record);
@@ -89,7 +95,6 @@ _PG_init(void)
     //                          NULL,
     //                          NULL,
     //                          NULL);
-
     // EmitWarningsOnPlaceholders("auto_explain");
     elog(LOG, "pg_init: nesting_leve:%d\n", nesting_level);
 
@@ -131,6 +136,9 @@ _PG_init(void)
 
     prev_ExecutorEnd_hook = ExecutorEnd_hook;
     ExecutorEnd_hook = ssl_ExecutorEnd;
+    // if(!ssl_connect_spi()){
+    //     elog(ERROR, "Failed to connect to SPI");
+    // }
 
     // prev_ExecutorEnd = ExecutorEnd_hook;
     // ExecutorEnd_hook = explain_ExecutorEnd;
@@ -142,6 +150,9 @@ _PG_init(void)
 void
 _PG_fini(void)
 {
+    // if(ssl_close_spi()){
+    //     elog(ERROR, "failed to finish spi");
+    // }
     /* Uninstall hooks. */
     ExecutorStart_hook = prev_ExecutorStart_hook;
     ExecutorRun_hook = prev_ExecutorRun_hook;
@@ -152,11 +163,51 @@ _PG_fini(void)
 }
 
 static bool 
+ssl_store_log_to_table(const char* query, double total_time){
+    char * insert_sql;
+    int ret;
+    elog(LOG, "[ssl_log_to_table] query:%s", query);
+    PG_TRY();
+    {
+        ssl_connect_spi();
+        insert_sql = psprintf("INSERT INTO %s VALUES ('%s', %f)",SSL_LOG_TABLE_NAME, query, total_time);
+        elog(LOG, "[ssl_log_to_table] insert_sql:%s", insert_sql);
+        ret = SPI_exec(insert_sql, 0);
+        if(ret < 0){
+            elog(ERROR, "Failed to execute insert query: %d", ret);
+            return false;
+        }
+        pfree(insert_sql);
+        ssl_close_spi();
+        return true;
+    }
+    PG_CATCH();
+    {
+        elog(ERROR, "Failed to execute insert query");
+        return false;
+    }
+    PG_END_TRY();
+}
+
+static bool ssl_connect_spi(void){
+    if(SPI_connect() != SPI_OK_CONNECT){
+        return false;
+    }
+    return true;
+}
+static bool ssl_close_spi(void){
+    int ret = SPI_finish();
+    if(SPI_OK_FINISH != ret){
+        return false;
+    }
+    return true;
+
+}
+
+static bool 
 ssl_store(const char* query, double total_time){
     FILE* file;
-    elog(LOG, "[ssl store], log_file:%s\n", SSL_LOG_FILE);
     file = AllocateFile(SSL_LOG_FILE, "a");
-    elog(LOG, "[ssl store], log_file:%s\n", SSL_LOG_FILE);
 
     if(file == NULL){
         elog(LOG, "file cannot open:%s\n", SSL_LOG_FILE);
@@ -167,6 +218,9 @@ ssl_store(const char* query, double total_time){
     }
     if(file != NULL){
         FreeFile(file);
+    }
+    if(!ssl_store_log_to_table(query, total_time)){
+        goto error;
     }
     return true;
 
@@ -267,9 +321,6 @@ ssl_ExecutorFinish(QueryDesc *queryDesc)
 
 static void
 ssl_ExecutorEnd(QueryDesc *queryDesc){
-    elog(LOG, "end: nesting_leve:%d\n", nesting_level);
-    elog(LOG, "end: queryDesc->totaltime->:%d\n", queryDesc->totaltime == NULL);
-    elog(LOG, "[slow_sql_recorder] nesting_leve:%d\n", nesting_level);
 
     if (queryDesc->totaltime!= NULL && slow_log_record_enabled(nesting_level))
     {
