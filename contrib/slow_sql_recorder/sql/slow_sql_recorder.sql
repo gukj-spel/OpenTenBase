@@ -1,10 +1,11 @@
-CREATE EXTENSION slow_sql_recorder;
-SET slow_sql_recorder.ssl_switch = TRUE;
-SET slow_sql_recorder.min_query_duration = 0;
+
 CREATE TABLE ssl_recoder(
     sql text,
     total_time double precision 
 );
+CREATE EXTENSION slow_sql_recorder;
+SET slow_sql_recorder.ssl_switch = TRUE;
+SET slow_sql_recorder.min_query_duration = 0;
 
 --
 -- Setup

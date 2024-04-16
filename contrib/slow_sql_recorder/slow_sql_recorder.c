@@ -31,10 +31,10 @@ static int    nesting_level = 0;
 static int min_query_duration = -1;
 static bool ssl_switch = false;
 
-// static sslSharedState* ssl_shared_state = NULL;
+static sslSharedState* ssl_shared_state = NULL;
 
 /* Saved hook values in case of unload */
-// static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun_hook = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish_hook = NULL;
@@ -50,10 +50,10 @@ static void ssl_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
                     uint64 count, bool execute_once);
 static void ssl_ExecutorFinish(QueryDesc *queryDesc);
 static void ssl_ExecutorStart(QueryDesc *queryDesc, int eflags);
-// static void ssl_shmem_startup(void);
-// static void ssl_shmem_shutdown(int code, Datum arg);
+static void ssl_shmem_startup(void);
+static void ssl_shmem_shutdown(int code, Datum arg);
 static bool ssl_store(const char* query, double total_time); //write the slow sql to the log file
-static bool ssl_store_log_to_table(const char* query, double total_time);
+static bool ssl_store_log_to_table(QueryDesc * queryDesc);
 static bool ssl_connect_spi(void);
 static bool ssl_close_spi(void);
 
@@ -122,8 +122,8 @@ _PG_init(void)
                             NULL);
     
 
-    // prev_shmem_startup_hook = shmem_startup_hook;
-    // shmem_startup_hook = ssl_shmem_startup;
+    prev_shmem_startup_hook = shmem_startup_hook;
+    shmem_startup_hook = ssl_shmem_startup;
     /* Install hooks. */
     prev_ExecutorStart_hook = ExecutorStart_hook;
     ExecutorStart_hook = ssl_ExecutorStart;
@@ -160,41 +160,48 @@ _PG_fini(void)
     ExecutorRun_hook = prev_ExecutorRun_hook;
     ExecutorFinish_hook = prev_ExecutorFinish_hook;
     ExecutorEnd_hook = prev_ExecutorEnd_hook;
-    // shmem_startup_hook = prev_shmem_startup_hook;
+    shmem_startup_hook = prev_shmem_startup_hook;
     
 }
 
 static bool 
-ssl_store_log_to_table(const char* query, double total_time){
+ssl_store_log_to_table(QueryDesc* queryDesc){
     char * insert_sql;
+    const char* query;
+    double total_time;
     int ret;
-    elog(LOG, "[ssl_log_to_table] query:%s", query);
+
+    MemoryContext oldcxt;
+    oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
+    query = queryDesc->sourceText;
+    total_time = queryDesc->totaltime->total * 1000;
     PG_TRY();
     {
-        ssl_connect_spi();
-        insert_sql = psprintf("INSERT INTO %s VALUES ('%s', %f)",SSL_LOG_TABLE_NAME, query, total_time);
+        if((ret = SPI_connect()) != SPI_OK_CONNECT){
+            elog(ERROR, "SPI connect failure - returned %d", ret);
+        }
+        insert_sql = psprintf("INSERT INTO %s (sql, total_time) VALUES ('%s', %f);",SSL_LOG_TABLE_NAME, query, total_time);
         elog(LOG, "[ssl_log_to_table] insert_sql:%s", insert_sql);
-        ret = SPI_exec(insert_sql, 0);
+        ret = SPI_execute(insert_sql, false, 0);
         if(ret < 0){
-            elog(ERROR, "Failed to execute insert query: %d", ret);
+            elog(ERROR, "Failed to execute insert log table: %d", ret);
             return false;
         }
         pfree(insert_sql);
-        ssl_close_spi();
+        SPI_finish();
         return true;
     }
     PG_CATCH();
     {
         elog(ERROR, "Failed to execute insert query");
+        MemoryContextSwitchTo(oldcxt);
         return false;
     }
     PG_END_TRY();
+    MemoryContextSwitchTo(oldcxt);
 }
 
 static bool ssl_connect_spi(void){
-    if(SPI_connect() != SPI_OK_CONNECT){
-        return false;
-    }
     return true;
 }
 static bool ssl_close_spi(void){
@@ -218,9 +225,6 @@ ssl_store(const char* query, double total_time){
         goto error;
     }
     if(fprintf(file, "%s,%.2f\n", query, total_time) <= 0 ||fflush(file) != 0){
-        goto error;
-    }
-    if(!ssl_store_log_to_table(query, total_time)){
         goto error;
     }
     FreeFile(file);
@@ -256,22 +260,23 @@ ssl_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 */
     elog(LOG, "begin: slow_log_record_enabled:%d\n", slow_log_record_enabled(nesting_level));
     elog(LOG, "begin: ssl_switch %d, nesting_level:%d\n", ssl_switch , nesting_level);
-
-	if (slow_log_record_enabled(nesting_level))
-	{
-		/*
-		 * Set up to track total elapsed time in ExecutorRun.  Make sure the
-		 * space is allocated in the per-query context so it will go away at
-		 * ExecutorEnd.
-		 */
-		if (queryDesc->totaltime == NULL)
-		{
-			MemoryContext oldcxt;
-			oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
-			queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_ALL);
-			MemoryContextSwitchTo(oldcxt);
-		}
-	}
+    if(queryDesc->operation == CMD_SELECT){
+        if (slow_log_record_enabled(nesting_level))
+        {
+            /*
+            * Set up to track total elapsed time in ExecutorRun.  Make sure the
+            * space is allocated in the per-query context so it will go away at
+            * ExecutorEnd.
+            */
+            if (queryDesc->totaltime == NULL)
+            {
+                MemoryContext oldcxt;
+                oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
+                queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_ALL);
+                MemoryContextSwitchTo(oldcxt);
+            }
+        }
+    }
 }
 
 
@@ -376,6 +381,7 @@ ssl_ExecutorEnd(QueryDesc *queryDesc){
             pfree(es->str->data);
         }
             ssl_store(queryDesc->sourceText, msec);
+            // ssl_store_log_to_table(queryDesc);
     }
 
     if (prev_ExecutorEnd_hook)
